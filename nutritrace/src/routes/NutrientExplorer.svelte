@@ -7,471 +7,691 @@
   import { vegetarianMode } from '../stores/settings.js';
   import { isAllowedInVegMode } from '../lib/dietType.js';
 
-  // Curated nutrient chips for quick selection
   const FEATURED_NUTRIENTS = [
     'iron', 'calcium', 'b12', 'zinc', 'vitamin-d', 'b9',
-    'fiber', 'proteins', 'vitamin-a', 'vitamin-c', 'magnesium', 'potassium'
+    'fiber', 'proteins', 'vitamin-a', 'vitamin-c', 'magnesium', 'potassium',
+  ];
+
+  const NUTRIENT_GROUPS = [
+    { key: 'all', label: 'Featured' },
+    { key: 'mineral', label: 'Minerals' },
+    { key: 'vitamin', label: 'Vitamins' },
+    { key: 'macro', label: 'Macros' },
   ];
 
   let foods = [];
   let members = [];
   let loading = true;
+  let loadError = '';
+  let selectedGroup = 'all';
   let selectedNutrientId = 'iron';
 
+  $: featuredNutrients = FEATURED_NUTRIENTS
+    .map(id => NUTRIMENTS.find(nutrient => nutrient.id === id))
+    .filter(Boolean);
+  $: visibleNutrients = selectedGroup === 'all'
+    ? featuredNutrients
+    : featuredNutrients.filter(nutrient => nutrient.category === selectedGroup);
   $: selectedNutrient = NUTRIMENTS.find(n => n.id === selectedNutrientId) || NUTRIMENTS.find(n => n.id === 'iron');
+  $: rankedFoods = foods
+    .filter(food => !$vegetarianMode || isAllowedInVegMode(food))
+    .filter(food => getNutrientValue(food, selectedNutrientId) > 0)
+    .sort((a, b) => getNutrientValue(b, selectedNutrientId) - getNutrientValue(a, selectedNutrientId))
+    .slice(0, 20);
+  $: familyNeed = getFamilyNeed();
+  $: bestFood = rankedFoods[0] || null;
 
-  // Reactive filtering and sorting
-  $: filteredFoods = (() => {
-    let list = foods;
-    if ($vegetarianMode) {
-      list = list.filter(f => isAllowedInVegMode(f));
-    }
-    // Filter to foods that have the selected nutrient value > 0
-    list = list.filter(f => {
-      const val = getNutrientValue(f, selectedNutrientId);
-      return val > 0;
-    });
-    // Sort descending by nutrient value per 100g
-    list.sort((a, b) => getNutrientValue(b, selectedNutrientId) - getNutrientValue(a, selectedNutrientId));
-    return list.slice(0, 20);
-  })();
+  function selectGroup(groupKey) {
+    selectedGroup = groupKey;
+    const nextNutrient = groupKey === 'all'
+      ? featuredNutrients[0]
+      : featuredNutrients.find(nutrient => nutrient.category === groupKey);
+    if (nextNutrient) selectedNutrientId = nextNutrient.id;
+  }
 
-  // Aggregate daily need for the selected nutrient across all family members
-  $: familyNeed = (() => {
+  function getFamilyNeed() {
     let total = 0;
     const breakdown = [];
-    for (const m of members) {
-      const need = m.targets?.[selectedNutrientId] || 0;
+
+    for (const member of members) {
+      const need = Number.parseFloat(member.targets?.[selectedNutrientId]) || 0;
       total += need;
-      if (need > 0) {
-        breakdown.push({ name: m.name, need });
-      }
+      if (need > 0) breakdown.push({ name: member.name || 'Family member', need });
     }
+
     return { total, breakdown };
-  })();
+  }
 
   function getNutrientValue(food, nutrientId) {
-    if (!food?.nutrition) return 0;
-    const val = parseFloat(food.nutrition[nutrientId]);
-    return isNaN(val) ? 0 : val;
+    const fromNutrition = Number.parseFloat(food?.nutrition?.[nutrientId]);
+    if (Number.isFinite(fromNutrition)) return fromNutrition;
+
+    const fromLegacyField = Number.parseFloat(food?.[nutrientId]);
+    return Number.isFinite(fromLegacyField) ? fromLegacyField : 0;
+  }
+
+  function getServingSize(food) {
+    const portion = Number.parseFloat(food?.portion);
+    return Number.isFinite(portion) && portion > 0 ? portion : 100;
+  }
+
+  function getPerServingValue(food) {
+    return getNutrientValue(food, selectedNutrientId) * (getServingSize(food) / 100);
   }
 
   function getPercentOfDaily(food) {
     if (!familyNeed.total || familyNeed.total <= 0) return 0;
-    const val = getNutrientValue(food, selectedNutrientId);
-    // Value is per 100g; assume a serving is the food's portion size
-    const portion = parseFloat(food.portion) || 100;
-    const perServing = val * (portion / 100);
-    return Math.min(Math.round((perServing / familyNeed.total) * 100), 100);
+    return Math.min(Math.round((getPerServingValue(food) / familyNeed.total) * 100), 100);
   }
 
-  function formatAmount(food) {
-    const val = getNutrientValue(food, selectedNutrientId);
-    return Nutrition.format(val) + ' ' + (selectedNutrient?.unit || '');
+  function formatAmount(value, nutrient = selectedNutrient) {
+    const unit = nutrient?.unit ? ` ${nutrient.unit}` : '';
+    return `${Nutrition.format(value)}${unit}`;
+  }
+
+  function formatFoodAmount(food) {
+    return `${formatAmount(getNutrientValue(food, selectedNutrientId))} per 100g`;
   }
 
   function getDietBadge(food) {
-    const dt = (food.diet_type || 'vegetarian').toLowerCase();
-    if (dt === 'vegan' || dt === 'vegetarian') return 'veg';
-    if (dt === 'eggetarian') return 'egg';
-    return 'nonveg';
+    const dietType = (food.diet_type || 'vegetarian').toLowerCase();
+    if (dietType === 'vegan' || dietType === 'vegetarian') return { icon: '🌿', label: 'Vegetarian' };
+    if (dietType === 'eggetarian') return { icon: '🥚', label: 'Eggetarian' };
+    return { icon: '🍗', label: 'Non-vegetarian' };
   }
 
-  async function addToPlan(food) {
-    // Navigate to diary to add this food
-    // Pass via sessionStorage for cross-route communication
+  async function addToDiary(food) {
     try {
       sessionStorage.setItem('nt:quickAdd', JSON.stringify({
         id: food.id,
         name: food.name,
         portion: food.portion,
         unit: food.unit,
-        nutrition: food.nutrition
+        nutrition: food.nutrition,
       }));
       push('/');
-    } catch (e) {
-      console.error('Failed to store quick add:', e);
+    } catch (err) {
+      loadError = 'Could not prepare this food for the diary. Please try again.';
+      console.error('[NutrientExplorer] quick add failed:', err);
     }
   }
 
-  onMount(async () => {
+  async function loadFoodSources() {
+    loading = true;
+    loadError = '';
     try {
       const [foodsRes, membersRes] = await Promise.all([
         NtApi.getFoods(),
-        NtApi.get('/api/family').catch(() => [])
+        NtApi.get('/api/family').catch(() => []),
       ]);
       foods = Array.isArray(foodsRes) ? foodsRes : [];
       members = Array.isArray(membersRes) ? membersRes : [];
     } catch (err) {
-      console.error('NutrientExplorer load error:', err);
+      loadError = 'Food-source exploration could not load. Retry after checking your connection.';
+      console.error('[NutrientExplorer] load error:', err);
     } finally {
       loading = false;
     }
-  });
+  }
+
+  onMount(loadFoodSources);
 </script>
 
-<div class="page-shell">
-  <header class="page-header">
-    <div class="ph-left">
-      <button class="icon-btn" on:click={() => push('/')}>
-        <span class="material-symbols-rounded">arrow_back</span>
+<div class="page-shell source-shell" in:fade={{ duration: 160 }}>
+  <header class="page-header source-header">
+    <div class="ph-left header-copy">
+      <button class="icon-btn" aria-label="Back to diary" on:click={() => push('/')}>
+        <span class="material-symbols-rounded" aria-hidden="true">arrow_back</span>
       </button>
-      <h1 class="page-title">Explore Nutrients</h1>
+      <div>
+        <p class="eyebrow">Food-source explorer</p>
+        <h1 class="page-title">Find foods rich in {selectedNutrient?.label || 'nutrients'}</h1>
+        <p class="page-subtitle">Choose a nutrient, compare top foods per 100g, and add a serving to today’s diary.</p>
+      </div>
     </div>
-    <div class="ph-right">
-      <label class="veg-toggle" title="Vegetarian filter">
-        <input type="checkbox" bind:checked={$vegetarianMode}>
-        <span class="veg-toggle-label">
-          <span class="veg-dot"></span> Veg
-        </span>
-      </label>
-    </div>
+    <label class="veg-toggle" title="Vegetarian filter">
+      <input type="checkbox" bind:checked={$vegetarianMode}>
+      <span class="veg-toggle-label"><span class="veg-dot" aria-hidden="true"></span>Vegetarian</span>
+    </label>
   </header>
 
-  <div class="page-content">
-    <!-- Nutrient Chips -->
-    <div class="nutrient-chips">
-      {#each FEATURED_NUTRIENTS as nid}
-        {@const n = NUTRIMENTS.find(x => x.id === nid)}
-        {#if n}
-          <button
-            class="chip"
-            class:active={selectedNutrientId === nid}
-            on:click={() => selectedNutrientId = nid}
-          >
-            {n.label}
-          </button>
-        {/if}
-      {/each}
-    </div>
-
-    <!-- Family Need Summary -->
-    {#if familyNeed.total > 0}
-      <div class="family-card" transition:fade={{ duration: 150 }}>
-        <div class="family-headline">
-          <span class="material-symbols-rounded" style="font-size:20px; color:var(--accent)">family_restroom</span>
-          <strong>{selectedNutrient?.label}: Family needs {Nutrition.format(familyNeed.total)}{selectedNutrient?.unit}/day</strong>
+  <div class="page-content source-content">
+    <section class="hero-card" aria-label="Food source guidance">
+      <div>
+        <p class="eyebrow">Start with a nutrient</p>
+        <h2>Explore practical food sources for the family table.</h2>
+        <p>Ranked foods use nutrient density per 100g, while the serving note shows how much one usual portion contributes to your family’s daily need.</p>
+      </div>
+      {#if bestFood}
+        <div class="hero-highlight">
+          <span>Top source now</span>
+          <strong>{bestFood.name}</strong>
+          <small>{formatFoodAmount(bestFood)}</small>
         </div>
-        {#if familyNeed.breakdown.length > 0}
-          <div class="family-breakdown">
-            {#each familyNeed.breakdown as b}
-              <span class="member-need">{b.name}: {Nutrition.format(b.need)}{selectedNutrient?.unit}</span>
-            {/each}
-          </div>
-        {/if}
-      </div>
-    {/if}
+      {/if}
+    </section>
 
-    <!-- Results -->
-    {#if loading}
-      <div class="empty-state">
-        <span class="material-symbols-rounded spin">progress_activity</span>
-        <p>Loading foods...</p>
-      </div>
-    {:else if foods.length === 0}
-      <div class="empty-state">
-        <span class="material-symbols-rounded" style="font-size:48px; color:var(--text-3)">nutrition</span>
-        <h2>No Foods in Library</h2>
-        <p>Import the Indian food database from Settings, or add foods manually.</p>
-        <button class="primary-btn mt-4" on:click={() => push('/settings')}>
-          <span class="material-symbols-rounded">settings</span> Go to Settings
-        </button>
-      </div>
-    {:else if filteredFoods.length === 0}
-      <div class="empty-state">
-        <span class="material-symbols-rounded" style="font-size:48px; color:var(--text-3)">search_off</span>
-        <h2>No Results</h2>
-        <p>No foods in your library have {selectedNutrient?.label || 'this nutrient'} data{$vegetarianMode ? ' (vegetarian filter active)' : ''}.</p>
-      </div>
-    {:else}
-      <div class="results-list">
-        {#each filteredFoods as food, i (food.id || i)}
-          <div class="result-card" transition:fade={{ duration: 120, delay: i * 20 }}>
-            <div class="rank-badge">#{i + 1}</div>
-            <div class="result-body">
-              <div class="result-top">
-                <div class="result-name">
-                  {food.name}
-                  {#if getDietBadge(food) === 'veg'}
-                    <span class="diet-badge veg" title="Vegetarian">&#127807;</span>
-                  {:else if getDietBadge(food) === 'egg'}
-                    <span class="diet-badge egg" title="Eggetarian">&#129370;</span>
-                  {/if}
-                </div>
-                <div class="result-amount">{formatAmount(food)} per 100g</div>
-              </div>
-              {#if familyNeed.total > 0}
-                <div class="progress-row">
-                  <div class="progress-bar">
-                    <div class="progress-fill" style="width: {getPercentOfDaily(food)}%"></div>
-                  </div>
-                  <span class="progress-label">{getPercentOfDaily(food)}% of daily need/serving</span>
-                </div>
-              {/if}
-            </div>
-            <button class="add-btn" on:click={() => addToPlan(food)} title="Add to today's diary">
-              <span class="material-symbols-rounded">add</span>
-            </button>
-          </div>
+    <section class="selector-card" aria-label="Nutrient filters">
+      <div class="group-selector" role="group" aria-label="Nutrient group">
+        {#each NUTRIENT_GROUPS as group}
+          <button
+            class:active={selectedGroup === group.key}
+            aria-pressed={selectedGroup === group.key}
+            on:click={() => selectGroup(group.key)}
+          >
+            {group.label}
+          </button>
         {/each}
       </div>
+
+      <div class="nutrient-chips" aria-label="Featured nutrient filters">
+        {#each visibleNutrients as nutrient}
+          <button
+            class="chip"
+            class:active={selectedNutrientId === nutrient.id}
+            aria-pressed={selectedNutrientId === nutrient.id}
+            on:click={() => selectedNutrientId = nutrient.id}
+          >
+            {nutrient.label}
+          </button>
+        {/each}
+      </div>
+    </section>
+
+    {#if familyNeed.total > 0}
+      <section class="summary-card" transition:fade={{ duration: 150 }} aria-label="Selected nutrient summary">
+        <div>
+          <p class="eyebrow">Selected nutrient</p>
+          <h2>{selectedNutrient?.label}: {formatAmount(familyNeed.total)}/day for the family</h2>
+          <p>{rankedFoods.length} food sources found{ $vegetarianMode ? ' with the vegetarian filter on' : '' }.</p>
+        </div>
+        <div class="member-needs">
+          {#each familyNeed.breakdown as memberNeed}
+            <span>{memberNeed.name}: {formatAmount(memberNeed.need)}</span>
+          {/each}
+        </div>
+      </section>
+    {:else}
+      <section class="summary-card compact" aria-label="Selected nutrient summary">
+        <div>
+          <p class="eyebrow">Selected nutrient</p>
+          <h2>{selectedNutrient?.label || 'Nutrient'} food sources</h2>
+          <p>Add family profiles to see daily need per serving. Rankings still show food density per 100g.</p>
+        </div>
+      </section>
+    {/if}
+
+    {#if loading}
+      <section class="state-card" aria-live="polite">
+        <span class="material-symbols-rounded spin" aria-hidden="true">progress_activity</span>
+        <h2>Loading food sources</h2>
+        <p>Gathering foods and family needs for nutrient exploration.</p>
+      </section>
+    {:else if loadError}
+      <section class="state-card error" aria-live="assertive">
+        <span class="material-symbols-rounded" aria-hidden="true">error</span>
+        <h2>Food sources unavailable</h2>
+        <p>{loadError}</p>
+        <button class="primary-btn" on:click={loadFoodSources}>Retry</button>
+      </section>
+    {:else if foods.length === 0}
+      <section class="state-card">
+        <span class="material-symbols-rounded" aria-hidden="true">nutrition</span>
+        <h2>No foods in your library</h2>
+        <p>Import the Indian food database from Settings, or add foods manually to begin source exploration.</p>
+        <button class="primary-btn" on:click={() => push('/settings')}>
+          <span class="material-symbols-rounded" aria-hidden="true">settings</span>
+          Go to Settings
+        </button>
+      </section>
+    {:else if rankedFoods.length === 0}
+      <section class="state-card">
+        <span class="material-symbols-rounded" aria-hidden="true">search_off</span>
+        <h2>No matching food sources</h2>
+        <p>No foods have {selectedNutrient?.label || 'this nutrient'} data{ $vegetarianMode ? ' with the vegetarian filter on' : '' }. Try another nutrient or filter.</p>
+      </section>
+    {:else}
+      <section class="results-list" aria-label={`Top foods ranked by ${selectedNutrient?.label || 'nutrient'} per 100g`}>
+        {#each rankedFoods as food, index (food.id || `${food.name}-${index}`)}
+          {@const dietBadge = getDietBadge(food)}
+          <article class="result-card" transition:fade={{ duration: 120, delay: Math.min(index * 16, 160) }}>
+            <div class="rank-badge" aria-label={`Rank ${index + 1}`}>#{index + 1}</div>
+            <div class="result-body">
+              <div class="result-top">
+                <h3>{food.name}</h3>
+                <span class="diet-badge" title={dietBadge.label} aria-label={dietBadge.label}>{dietBadge.icon}</span>
+              </div>
+              <p class="result-amount">{formatFoodAmount(food)}</p>
+              {#if familyNeed.total > 0}
+                <div class="serving-row">
+                  <div class="progress-bar" aria-hidden="true">
+                    <div class="progress-fill" style={`transform: scaleX(${getPercentOfDaily(food) / 100})`}></div>
+                  </div>
+                  <span>{getPercentOfDaily(food)}% of family daily need per {getServingSize(food)}{food.unit || 'g'} serving</span>
+                </div>
+              {:else}
+                <p class="serving-note">Typical serving: {getServingSize(food)}{food.unit || 'g'}</p>
+              {/if}
+            </div>
+            <button class="add-btn" aria-label={`Add ${food.name} to today’s diary`} on:click={() => addToDiary(food)}>
+              <span class="material-symbols-rounded" aria-hidden="true">add</span>
+            </button>
+          </article>
+        {/each}
+      </section>
     {/if}
   </div>
 </div>
 
 <style>
-  .nutrient-chips {
+  .source-shell {
+    --source-card-bg: var(--surface-1);
+    --source-soft-bg: color-mix(in srgb, var(--accent) 8%, var(--surface-1));
+  }
+
+  .source-header {
+    align-items: flex-start;
+    gap: 16px;
+  }
+
+  .header-copy {
+    align-items: flex-start;
+  }
+
+  .eyebrow {
+    margin: 0 0 6px;
+    color: var(--accent);
+    font-size: 0.74rem;
+    font-weight: 800;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+  .page-subtitle {
+    max-width: 680px;
+    margin: 6px 0 0;
+    color: var(--text-secondary, var(--text-2));
+    font-size: clamp(0.92rem, 0.88rem + 0.2vw, 1rem);
+    line-height: 1.5;
+  }
+
+  .source-content {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+
+  .hero-card,
+  .selector-card,
+  .summary-card,
+  .state-card,
+  .result-card {
+    background: var(--source-card-bg);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+  }
+
+  .hero-card {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(180px, 280px);
+    gap: 20px;
+    padding: 20px;
+    background: linear-gradient(135deg, var(--source-soft-bg), var(--surface-1) 62%);
+  }
+
+  .hero-card h2,
+  .summary-card h2,
+  .state-card h2,
+  .result-top h3 {
+    margin: 0;
+    color: var(--text-primary, var(--text-1));
+  }
+
+  .hero-card h2 {
+    font-size: clamp(1.35rem, 1.08rem + 1.2vw, 2rem);
+    line-height: 1.1;
+  }
+
+  .hero-card p,
+  .summary-card p,
+  .state-card p,
+  .serving-note {
+    margin: 8px 0 0;
+    color: var(--text-secondary, var(--text-2));
+    line-height: 1.5;
+  }
+
+  .hero-highlight {
+    align-self: stretch;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 6px;
+    padding: 16px;
+    border: 1px solid color-mix(in srgb, var(--accent) 18%, var(--border));
+    border-radius: 12px;
+    background: color-mix(in srgb, var(--surface-1) 88%, var(--accent));
+  }
+
+  .hero-highlight span,
+  .hero-highlight small {
+    color: var(--text-secondary, var(--text-2));
+  }
+
+  .hero-highlight strong {
+    color: var(--text-primary, var(--text-1));
+    font-size: 1.08rem;
+  }
+
+  .selector-card,
+  .summary-card {
+    padding: 16px;
+  }
+
+  .group-selector,
+  .nutrient-chips,
+  .member-needs {
     display: flex;
     flex-wrap: wrap;
     gap: 8px;
-    margin-bottom: 16px;
   }
+
+  .group-selector {
+    margin-bottom: 12px;
+  }
+
+  .group-selector button,
   .chip {
-    padding: 6px 14px;
-    border-radius: 20px;
+    min-height: 44px;
     border: 1px solid var(--border);
-    background: var(--surface-1);
     color: var(--text-secondary, var(--text-2));
-    font-size: 13px;
-    font-weight: 500;
+    background: var(--surface-1);
     cursor: pointer;
-    transition: all 0.15s ease;
+    font-weight: 700;
+  }
+
+  .group-selector button {
+    padding: 0 14px;
+    border-radius: 10px;
+  }
+
+  .chip {
+    padding: 0 16px;
+    border-radius: 999px;
     white-space: nowrap;
   }
+
+  .group-selector button:hover,
   .chip:hover {
     border-color: var(--accent);
     color: var(--accent);
   }
+
+  .group-selector button:focus-visible,
+  .chip:focus-visible,
+  .add-btn:focus-visible,
+  .veg-toggle input:focus-visible + .veg-toggle-label {
+    outline: 3px solid color-mix(in srgb, var(--accent) 30%, transparent);
+    outline-offset: 2px;
+  }
+
+  .group-selector button.active,
   .chip.active {
+    border-color: var(--accent);
     background: var(--accent);
     color: var(--accent-text);
-    border-color: var(--accent);
   }
 
-  /* Family card */
-  .family-card {
-    background: var(--surface-1);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 14px 16px;
-    margin-bottom: 16px;
-  }
-  .family-headline {
-    display: flex;
+  .summary-card {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(180px, 320px);
+    gap: 16px;
     align-items: center;
-    gap: 8px;
-    font-size: 14px;
-    color: var(--text-primary, var(--text-1));
-  }
-  .family-breakdown {
-    margin-top: 8px;
-    display: flex;
-    flex-wrap: wrap;
-    gap: 8px 16px;
-  }
-  .member-need {
-    font-size: 12px;
-    color: var(--text-secondary, var(--text-2));
   }
 
-  /* Results list */
+  .summary-card.compact {
+    display: block;
+  }
+
+  .member-needs span {
+    color: var(--text-secondary, var(--text-2));
+    font-size: 0.86rem;
+  }
+
   .results-list {
     display: flex;
     flex-direction: column;
-    gap: 10px;
-  }
-  .result-card {
-    display: flex;
-    align-items: center;
     gap: 12px;
-    background: var(--surface-1);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 12px 14px;
-    transition: box-shadow 0.15s;
   }
+
+  .result-card {
+    display: grid;
+    grid-template-columns: 44px minmax(0, 1fr) 44px;
+    gap: 14px;
+    align-items: center;
+    padding: 14px;
+  }
+
   .result-card:hover {
-    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+    border-color: color-mix(in srgb, var(--accent) 28%, var(--border));
   }
 
   .rank-badge {
-    min-width: 32px;
-    height: 32px;
-    border-radius: 8px;
-    background: color-mix(in srgb, var(--accent) 12%, transparent);
-    color: var(--accent);
-    font-weight: 700;
-    font-size: 13px;
     display: flex;
     align-items: center;
     justify-content: center;
-    flex-shrink: 0;
+    width: 44px;
+    height: 44px;
+    border-radius: 12px;
+    background: var(--source-soft-bg);
+    color: var(--accent);
+    font-size: 0.9rem;
+    font-weight: 800;
   }
 
   .result-body {
-    flex: 1;
     min-width: 0;
   }
+
   .result-top {
     display: flex;
-    justify-content: space-between;
-    align-items: baseline;
-    gap: 8px;
-    flex-wrap: wrap;
-  }
-  .result-name {
-    font-size: 14px;
-    font-weight: 500;
-    color: var(--text-primary, var(--text-1));
-    display: flex;
     align-items: center;
-    gap: 6px;
+    gap: 8px;
+  }
+
+  .result-top h3 {
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-  }
-  .result-amount {
-    font-size: 12px;
-    color: var(--text-secondary, var(--text-2));
-    white-space: nowrap;
-    font-weight: 500;
+    font-size: 1rem;
   }
 
   .diet-badge {
-    font-size: 14px;
-    flex-shrink: 0;
+    flex: 0 0 auto;
+    font-size: 1rem;
   }
 
-  /* Progress */
-  .progress-row {
-    display: flex;
+  .result-amount {
+    margin: 4px 0 0;
+    color: var(--text-primary, var(--text-1));
+    font-size: 0.92rem;
+    font-weight: 700;
+  }
+
+  .serving-row {
+    display: grid;
+    grid-template-columns: minmax(80px, 1fr) auto;
+    gap: 10px;
     align-items: center;
-    gap: 8px;
-    margin-top: 6px;
-  }
-  .progress-bar {
-    flex: 1;
-    height: 6px;
-    border-radius: 3px;
-    background: color-mix(in srgb, var(--accent) 10%, var(--surface-1));
-    overflow: hidden;
-  }
-  .progress-fill {
-    height: 100%;
-    border-radius: 3px;
-    background: var(--accent);
-    transition: width 0.3s ease;
-  }
-  .progress-label {
-    font-size: 11px;
-    color: var(--text-secondary, var(--text-3));
-    white-space: nowrap;
-    min-width: fit-content;
+    margin-top: 8px;
   }
 
-  /* Add button */
+  .serving-row span {
+    color: var(--text-secondary, var(--text-2));
+    font-size: 0.82rem;
+    white-space: nowrap;
+  }
+
+  .progress-bar {
+    height: 8px;
+    overflow: hidden;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--accent) 10%, var(--surface-2, var(--surface-1)));
+  }
+
+  .progress-fill {
+    width: 100%;
+    height: 100%;
+    border-radius: inherit;
+    background: var(--accent);
+    transform-origin: left center;
+  }
+
   .add-btn {
     min-width: 44px;
     min-height: 44px;
     width: 44px;
     height: 44px;
-    border-radius: 8px;
     border: 1px solid var(--border);
+    border-radius: 12px;
     background: var(--surface-1);
     color: var(--accent);
+    cursor: pointer;
     display: flex;
     align-items: center;
     justify-content: center;
-    cursor: pointer;
-    flex-shrink: 0;
-    transition: all 0.15s ease;
-  }
-  .add-btn:hover {
-    background: var(--accent);
-    color: var(--accent-text);
-    border-color: var(--accent);
-  }
-  .add-btn .material-symbols-rounded {
-    font-size: 20px;
   }
 
-  /* Veg toggle */
+  .add-btn:hover {
+    border-color: var(--accent);
+    background: var(--accent);
+    color: var(--accent-text);
+  }
+
   .veg-toggle {
     display: flex;
     align-items: center;
-    gap: 6px;
     cursor: pointer;
     user-select: none;
   }
+
   .veg-toggle input {
-    display: none;
+    position: absolute;
+    opacity: 0;
+    pointer-events: none;
   }
+
   .veg-toggle-label {
+    min-height: 44px;
     display: flex;
     align-items: center;
-    gap: 4px;
-    font-size: 13px;
-    font-weight: 500;
-    padding: 4px 10px;
-    border-radius: 16px;
+    gap: 8px;
+    padding: 0 14px;
     border: 1px solid var(--border);
+    border-radius: 999px;
     background: var(--surface-1);
     color: var(--text-secondary, var(--text-2));
-    transition: all 0.15s ease;
+    font-size: 0.9rem;
+    font-weight: 700;
   }
+
   .veg-toggle input:checked + .veg-toggle-label {
-    background: var(--diet-veg-dim);
-    border-color: var(--diet-veg);
-    color: var(--diet-veg);
+    border-color: var(--diet-veg, var(--accent));
+    background: var(--diet-veg-dim, var(--source-soft-bg));
+    color: var(--diet-veg, var(--accent));
   }
+
   .veg-dot {
     width: 8px;
     height: 8px;
-    border-radius: 50%;
-    background: var(--diet-veg);
+    border-radius: 999px;
+    background: var(--diet-veg, var(--accent));
   }
 
-  /* Empty state */
-  .empty-state {
+  .state-card {
     text-align: center;
-    padding: 48px 16px;
+    padding: 48px 20px;
     color: var(--text-secondary, var(--text-2));
   }
-  .empty-state h2 {
-    margin: 12px 0 4px;
-    color: var(--text-primary, var(--text-1));
-    font-size: 18px;
-  }
-  .empty-state p {
-    font-size: 14px;
-    max-width: 300px;
-    margin: 0 auto;
+
+  .state-card .material-symbols-rounded {
+    color: var(--accent);
+    font-size: 44px;
   }
 
-  /* Spinner */
+  .state-card.error .material-symbols-rounded {
+    color: var(--danger, #b42318);
+  }
+
+  .state-card .primary-btn {
+    min-height: 44px;
+    margin-top: 16px;
+  }
+
   .spin {
-    font-size: 32px;
-    color: var(--accent);
     animation: spin 1s linear infinite;
   }
+
   @keyframes spin {
     to { transform: rotate(360deg); }
   }
 
-  /* Responsive */
+  @media (prefers-reduced-motion: reduce) {
+    .spin {
+      animation-duration: 2.5s;
+    }
+  }
+
+  @media (max-width: 720px) {
+    .source-header,
+    .hero-card,
+    .summary-card {
+      grid-template-columns: 1fr;
+    }
+
+    .source-header {
+      align-items: stretch;
+    }
+
+    .hero-card,
+    .selector-card,
+    .summary-card {
+      padding: 16px;
+    }
+
+    .serving-row {
+      grid-template-columns: 1fr;
+      gap: 6px;
+    }
+
+    .serving-row span {
+      white-space: normal;
+    }
+  }
+
   @media (max-width: 480px) {
     .nutrient-chips {
-      overflow-x: auto;
       flex-wrap: nowrap;
-      -webkit-overflow-scrolling: touch;
-      scrollbar-width: none;
+      overflow-x: auto;
       padding-bottom: 4px;
+      scrollbar-width: none;
+      -webkit-overflow-scrolling: touch;
     }
-    .nutrient-chips::-webkit-scrollbar { display: none; }
-    .result-top {
-      flex-direction: column;
-      gap: 2px;
+
+    .nutrient-chips::-webkit-scrollbar {
+      display: none;
+    }
+
+    .result-card {
+      grid-template-columns: 40px minmax(0, 1fr) 44px;
+      gap: 10px;
+      padding: 12px;
+    }
+
+    .rank-badge {
+      width: 40px;
+      height: 40px;
     }
   }
 </style>
