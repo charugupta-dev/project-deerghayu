@@ -1,7 +1,7 @@
 <script>
   import { onMount, onDestroy, createEventDispatcher } from 'svelte';
   import { fly } from 'svelte/transition';
-  import { isNative } from '../../lib/platform.js';
+  import { isNative, getNativeMode } from '../../lib/platform.js';
 
   // Portal to document.body — prevents position:fixed being trapped by
   // ancestor transforms or opacity transitions (common iOS issue)
@@ -15,7 +15,11 @@
       }
     };
   }
-  import { barcodeBeep, barcodeFlashlight } from '../../stores/settings.js';
+  import { barcodeBeep, barcodeFlashlight, aiEffectivelyEnabled, envLocks, aiProvider, aiApiKey, aiModel, aiBaseUrl } from '../../stores/settings.js';
+  import { callAI, callAIProxy } from '../../lib/aiChat.js';
+  import { NUTRIMENTS } from '../../lib/nutrition.js';
+  import { parseNutritionTextLocally, matchAndCalculateRecipeLocally } from '../../lib/recipeMatcher.js';
+  import Dialog from '../ui/Dialog.svelte';
 
   export let open = false;
 
@@ -34,6 +38,13 @@
   let manualCode = '';
   let scanlineVisible = false;
   let scanning = false;
+  $: _isNativeLocal = isNative && getNativeMode() === 'local';
+  $: _canUseAiLabelScan = $aiEffectivelyEnabled && !_isNativeLocal;
+
+  /** AI OCR privacy opt-in state */
+  let showAiOcrConfirm = false;
+  let _pendingAiOcrScan = null; // holds the closure to resume scan after opt-in
+  $: _aiOcrOptedIn = typeof localStorage !== 'undefined' && localStorage.getItem('nt:aiOcrOptedIn') === 'true';
 
   // CSS injected for quagga/html5qr video fill
   let styleEl = null;
@@ -463,6 +474,280 @@
     dispatch('scan', { code });
   }
 
+  let ocrLoading = false;
+  let scanLabelFileInput;
+
+  async function _captureLabelPhoto() {
+    if (isNative) {
+      try {
+        const { Camera, CameraResultType, CameraSource } = await import('@capacitor/camera');
+        const photo = await Camera.getPhoto({
+          quality: 80,
+          resultType: CameraResultType.Base64,
+          source: CameraSource.Camera,
+          width: 1600,
+        });
+        return { base64: photo.base64String, mimeType: `image/${photo.format || 'jpeg'}` };
+      } catch (err) {
+        console.warn('[BarcodeScanner] Camera capture failed:', err);
+        return null;
+      }
+    }
+    return new Promise((resolve) => {
+      const handler = (e) => {
+        scanLabelFileInput.removeEventListener('change', handler);
+        const file = e.target.files?.[0];
+        if (!file) { resolve(null); return; }
+        const reader = new FileReader();
+        reader.onload = () => {
+          const dataUrl = reader.result;
+          const m = /^data:([^;]+);base64,(.+)$/.exec(dataUrl);
+          if (!m) { resolve(null); return; }
+          resolve({ mimeType: m[1], base64: m[2] });
+        };
+        reader.readAsDataURL(file);
+      };
+      scanLabelFileInput.addEventListener('change', handler);
+      scanLabelFileInput.value = '';
+      scanLabelFileInput.click();
+    });
+  }
+
+  function _buildLabelMessages(provider, image) {
+    const prompt = [
+      'Extract nutrition facts from this label image.',
+      'Return ONLY a JSON object with these keys (omit keys you cannot read):',
+      '  name (string, product name), brand (string), portion (number), unit (string, one of g/ml/oz/fl oz/cup/tsp/tbsp/lb/kg/l/each),',
+      '  per_serving (boolean, true if the listed values are per serving, false if per 100g),',
+      '  ingredients (string, raw ingredients list text on the label),',
+      '  calories (kcal), kilojoules (kJ),',
+      '  fat (g), saturated-fat (g), trans-fat (g), polyunsaturated-fat (g), monounsaturated-fat (g),',
+      '  carbohydrates (g), sugars (g), added-sugars (g), fiber (g),',
+      '  proteins (g),',
+      '  sodium (mg), salt (g), potassium (mg), cholesterol (mg),',
+      '  calcium (mg), iron (mg), magnesium (mg), zinc (mg), phosphorus (mg),',
+      '  vitamin-d (µg), vitamin-a (µg), vitamin-c (mg), vitamin-e (mg), vitamin-k (µg),',
+      '  b1 (mg), b2 (mg), b3 (mg), b6 (mg), b9 (µg), b12 (µg),',
+      '  caffeine (mg), alcohol (g)',
+      'Use numbers, not strings. Use the units specified, not the label\'s.',
+      'No commentary, no markdown — JSON only.',
+    ].join('\n');
+    if (provider === 'claude') {
+      return [{ role: 'user', content: [
+        { type: 'image', source: { type: 'base64', media_type: image.mediaType || image.mimeType, data: image.base64 } },
+        { type: 'text', text: prompt },
+      ]}];
+    }
+    if (provider === 'openai' || provider === 'oai-compat') {
+      return [{ role: 'user', content: [
+        { type: 'image_url', image_url: { url: `data:${image.mimeType};base64,${image.base64}` } },
+        { type: 'text', text: prompt },
+      ]}];
+    }
+    if (provider === 'gemini') {
+      return [{ role: 'user', content: prompt, _image: image }];
+    }
+    return [{ role: 'user', content: prompt }];
+  }
+
+  function _parseJsonFromReply(text) {
+    if (!text) return null;
+    const cleaned = text.replace(/^\s*```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim();
+    try { return JSON.parse(cleaned); } catch {}
+    const m = cleaned.match(/\{[\s\S]*\}/);
+    if (m) { try { return JSON.parse(m[0]); } catch {} }
+    return null;
+  }
+
+  async function scanLabelOcrAI() {
+    if (ocrLoading) return;
+
+    // Privacy gate: confirm before sending photo to cloud AI
+    const optedIn = typeof localStorage !== 'undefined' && localStorage.getItem('nt:aiOcrOptedIn') === 'true';
+    if (!optedIn) {
+      // Store a closure that will resume the scan after opt-in confirmation
+      _pendingAiOcrScan = async () => {
+        _pendingAiOcrScan = null;
+        await _doScanLabelOcrAI();
+      };
+      showAiOcrConfirm = true;
+      return;
+    }
+
+    await _doScanLabelOcrAI();
+  }
+
+  function _onAiOcrConfirm() {
+    showAiOcrConfirm = false;
+    try { localStorage.setItem('nt:aiOcrOptedIn', 'true'); } catch {}
+    // Resume the pending scan if one was queued
+    if (_pendingAiOcrScan) {
+      _pendingAiOcrScan();
+    }
+  }
+
+  function _onAiOcrCancel() {
+    showAiOcrConfirm = false;
+    _pendingAiOcrScan = null;
+    // Re-enable barcode scanning if it was disabled
+    detected = false;
+  }
+
+  /** Internal — performs the actual AI OCR scan (called after privacy opt-in gate) */
+  async function _doScanLabelOcrAI() {
+    if (ocrLoading) return;
+    detected = true; // disable barcode scanning in background
+    const image = await _captureLabelPhoto();
+    if (!image || !image.base64) {
+      detected = false;
+      return;
+    }
+    ocrLoading = true;
+    try {
+      const provider = $aiProvider || 'claude';
+      const messages = _buildLabelMessages(provider, image);
+      const systemPrompt = 'You are a nutrition label parser. Return JSON only.';
+      const reply = $envLocks.ai
+        ? await callAIProxy({ messages, systemPrompt })
+        : await callAI({
+            provider, apiKey: $aiApiKey, model: $aiModel, baseUrl: $aiBaseUrl,
+            messages, systemPrompt,
+          });
+      const parsed = _parseJsonFromReply(reply);
+      if (!parsed || typeof parsed !== 'object') {
+        const { showError } = await import('../../stores/toast.js');
+        showError('Could not read the label. Try a clearer photo.');
+        detected = false;
+        return;
+      }
+      
+      const portion = parsed.portion != null ? Number(parsed.portion) : 100;
+      // If listed values are per 100g (per_serving false) but portion is not 100, we scale nutrients to match portion
+      const factor = (parsed.per_serving === false && portion !== 100) ? (portion / 100) : 1;
+
+      const foodItem = {
+        name: parsed.name || '',
+        brand: parsed.brand || '',
+        portion: portion,
+        unit: parsed.unit || 'g',
+        ingredientsText: parsed.ingredients || '',
+        nutrition: {},
+      };
+
+      for (const n of NUTRIMENTS) {
+        const v = parsed[n.id];
+        if (v != null && !isNaN(parseFloat(v))) {
+          foodItem.nutrition[n.id] = parseFloat(v) * factor;
+        }
+      }
+
+      // Match ingredients locally from extracted list
+      if (parsed.ingredients) {
+        try {
+          const matched = await matchAndCalculateRecipeLocally(parsed.ingredients, portion);
+          if (matched && matched.ingredients && matched.ingredients.length > 0) {
+            foodItem.ingredients = matched.ingredients;
+            // Merge matching nutrients if not parsed from label
+            for (const n of NUTRIMENTS) {
+              if (foodItem.nutrition[n.id] == null && matched.nutrition[n.id] != null) {
+                foodItem.nutrition[n.id] = matched.nutrition[n.id];
+              }
+            }
+          }
+        } catch (matchErr) {
+          console.warn('[BarcodeScanner] Local ingredients matching failed on AI path:', matchErr);
+        }
+      }
+
+      open = false;
+      dispatch('scan-label-success', { parsed: foodItem });
+    } catch (e) {
+      console.error('[BarcodeScanner] Label OCR failed:', e);
+      const { showError } = await import('../../stores/toast.js');
+      showError('Scan failed: ' + (e?.message || 'unknown error'));
+      detected = false;
+    } finally {
+      ocrLoading = false;
+    }
+  }
+
+  async function scanLabelOcrLocal() {
+    if (ocrLoading) return;
+    detected = true; // disable barcode scanning in background
+    const image = await _captureLabelPhoto();
+    if (!image || !image.base64) {
+      detected = false;
+      return;
+    }
+    ocrLoading = true;
+    try {
+      let textDetections = [];
+      if (isNative) {
+        const { Ocr } = await import('@jcesarmobile/capacitor-ocr');
+        const res = await Ocr.process({ image: `data:${image.mimeType};base64,${image.base64}` });
+        textDetections = res.results || [];
+      } else {
+        const { showError } = await import('../../stores/toast.js');
+        showError('Local OCR requires running on a native device. Please use AI Scan on web.');
+        detected = false;
+        return;
+      }
+
+      if (textDetections.length === 0) {
+        const { showError } = await import('../../stores/toast.js');
+        showError('No text detected on the label. Try a clearer photo.');
+        detected = false;
+        return;
+      }
+
+      const parsed = parseNutritionTextLocally(textDetections);
+      const portion = parsed.portion != null ? Number(parsed.portion) : 100;
+      const factor = (parsed.per_serving === false && portion !== 100) ? (portion / 100) : 1;
+
+      const foodItem = {
+        name: parsed.name || '',
+        brand: parsed.brand || '',
+        portion: portion,
+        unit: parsed.unit || 'g',
+        ingredientsText: parsed.ingredientsText || '',
+        nutrition: {},
+      };
+
+      for (const n of NUTRIMENTS) {
+        const v = parsed.nutrition[n.id];
+        if (v != null && !isNaN(parseFloat(v))) {
+          foodItem.nutrition[n.id] = parseFloat(v) * factor;
+        }
+      }
+
+      if (parsed.ingredientsText) {
+        try {
+          const matched = await matchAndCalculateRecipeLocally(parsed.ingredientsText, portion);
+          if (matched && matched.ingredients && matched.ingredients.length > 0) {
+            foodItem.ingredients = matched.ingredients;
+            for (const n of NUTRIMENTS) {
+              if (foodItem.nutrition[n.id] == null && matched.nutrition[n.id] != null) {
+                foodItem.nutrition[n.id] = matched.nutrition[n.id];
+              }
+            }
+          }
+        } catch (matchErr) {
+          console.warn('[BarcodeScanner] Local ingredients matching failed on Local path:', matchErr);
+        }
+      }
+
+      open = false;
+      dispatch('scan-label-success', { parsed: foodItem });
+    } catch (e) {
+      console.error('[BarcodeScanner] Local label OCR failed:', e);
+      const { showError } = await import('../../stores/toast.js');
+      showError('Scan failed: ' + (e?.message || 'unknown error'));
+      detected = false;
+    } finally {
+      ocrLoading = false;
+    }
+  }
+
   $: if (open && !scanning) {
     if (isNative) startNativeScanner();
     else startScanner();
@@ -513,6 +798,22 @@
     </div>
 
     <div class="ns-bottom">
+      {#if _canUseAiLabelScan}
+        <button class="sc-btn" style="margin-bottom:8px" on:click={scanLabelOcrAI} disabled={ocrLoading}>
+          <span class="material-symbols-rounded" class:spin={ocrLoading}>{ocrLoading ? 'progress_activity' : 'photo_camera'}</span>
+          <span>{ocrLoading ? 'Scanning label…' : 'Scan Nutrition Label (AI)'}</span>
+        </button>
+        {#if _aiOcrOptedIn}
+          <div class="ns-ai-indicator">
+            <span class="material-symbols-rounded" style="font-size:14px">cloud_upload</span>
+            <span>AI sends photos to cloud</span>
+          </div>
+        {/if}
+      {/if}
+      <button class="sc-btn" style="margin-bottom:8px" on:click={scanLabelOcrLocal} disabled={ocrLoading}>
+        <span class="material-symbols-rounded" class:spin={ocrLoading}>{ocrLoading ? 'progress_activity' : 'photo_camera'}</span>
+        <span>{ocrLoading ? 'Scanning label…' : 'Scan Label (Local OCR)'}</span>
+      </button>
       <div class="ns-manual">
         <input
           class="input"
@@ -593,6 +894,22 @@
             {torchOn ? 'Flash On' : 'Flash Off'}
           </button>
         {/if}
+        {#if _canUseAiLabelScan}
+          <button class="sc-btn" on:click={scanLabelOcrAI} disabled={ocrLoading}>
+            <span class="material-symbols-rounded" class:spin={ocrLoading}>{ocrLoading ? 'progress_activity' : 'photo_camera'}</span>
+            <span>{ocrLoading ? 'Scanning label…' : 'Scan Label (AI)'}</span>
+          </button>
+          {#if _aiOcrOptedIn}
+            <span class="ai-indicator">
+              <span class="material-symbols-rounded" style="font-size:14px">cloud_upload</span>
+              AI sends photos to cloud
+            </span>
+          {/if}
+        {/if}
+        <button class="sc-btn" on:click={scanLabelOcrLocal} disabled={ocrLoading}>
+          <span class="material-symbols-rounded" class:spin={ocrLoading}>{ocrLoading ? 'progress_activity' : 'photo_camera'}</span>
+          <span>{ocrLoading ? 'Scanning label…' : 'Scan Label (Local)'}</span>
+        </button>
       </div>
 
       <!-- Manual entry -->
@@ -606,9 +923,21 @@
         />
         <button class="btn btn-primary" on:click={doManual}>Look Up</button>
       </div>
+      <input bind:this={scanLabelFileInput} type="file" accept="image/*" capture="environment" style="display:none" />
     </div>
   </div>
 {/if}
+
+<!-- AI OCR privacy confirmation dialog -->
+<Dialog
+  open={showAiOcrConfirm}
+  title="AI Photo Upload"
+  message="Send photo to AI for parsing? Your photo will be uploaded to {$aiProvider || 'the AI provider'} for processing. You can change this later in settings."
+  confirmText="Allow"
+  cancelText="Cancel"
+  on:confirm={_onAiOcrConfirm}
+  on:cancel={_onAiOcrCancel}
+/>
 
 <style>
   .scanner-backdrop {
@@ -743,20 +1072,30 @@
   .sc-btn {
     display: inline-flex;
     align-items: center;
-    gap: 5px;
+    gap: 6px;
     border: 1px solid var(--border);
-    border-radius: 16px;
-    padding: 5px 12px;
-    font-size: 12px;
+    border-radius: 22px;
+    padding: 8px 16px;
+    min-height: 44px;
+    font-size: 13px;
+    font-weight: 500;
     cursor: pointer;
     background: var(--surface-1);
     color: var(--text-2);
     white-space: nowrap;
     transition: background var(--dur-fast), color var(--dur-fast);
   }
-  .sc-btn .material-symbols-rounded { font-size: 14px; }
+  .sc-btn .material-symbols-rounded { font-size: 18px; }
   .sc-btn.sc-btn-active { background: color-mix(in srgb, var(--accent) 20%, transparent); color: var(--accent); border-color: var(--accent); }
   .sc-btn.sc-btn-torch  { background: color-mix(in srgb, #fbbf24 20%, transparent); color: #fbbf24; border-color: #fbbf24; }
+  .ai-indicator {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 11px;
+    color: var(--text-3);
+    white-space: nowrap;
+  }
 
   .scanner-manual {
     display: flex;
@@ -794,8 +1133,8 @@
     background: rgba(0,0,0,0.5);
     color: #fff;
     border-radius: 50%;
-    width: 40px;
-    height: 40px;
+    width: 44px;
+    height: 44px;
   }
   .ns-torch.active { background: rgba(251,191,36,0.85); color: #000; }
   .ns-status {
@@ -841,9 +1180,27 @@
   }
   .ns-bottom .sc-btn {
     align-self: center;
-    background: rgba(0,0,0,0.6);
+    background: rgba(0,0,0,0.65);
     color: #fff;
-    border-color: rgba(255,255,255,0.2);
+    border-color: rgba(255,255,255,0.25);
+    min-height: 44px;
+    padding: 10px 20px;
+    border-radius: 22px;
+    font-size: 13px;
+    font-weight: 600;
+    width: 90%;
+    max-width: 320px;
+    justify-content: center;
+  }
+  .ns-ai-indicator {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    font-size: 11px;
+    color: rgba(255,255,255,0.7);
+    margin-top: -4px;
+    margin-bottom: 4px;
   }
   .ns-bottom .sc-btn.sc-btn-active {
     background: color-mix(in srgb, var(--accent) 80%, transparent);

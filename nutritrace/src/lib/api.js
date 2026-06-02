@@ -57,6 +57,32 @@ const API = {
 
   async lookupBarcode(barcode) {
     try {
+      // Check local SQLite database first in native standalone mode
+      const { isNative, getNativeMode } = await import('./platform.js');
+      if (isNative && getNativeMode() === 'local') {
+        try {
+          const { getDb } = await import('./db-native.js');
+          const db = await getDb();
+          const r = await db.query(
+            `SELECT * FROM foods WHERE barcode = ? AND deleted_at IS NULL LIMIT 1`,
+            [barcode]
+          );
+          const row = r?.values?.[0];
+          if (row) {
+            const categories = row.category ? [row.category] : [];
+            return {
+              ...row,
+              imgUrl: row.img_url || '',
+              categories,
+              nutrition: typeof row.nutrition === 'string' ? JSON.parse(row.nutrition) : (row.nutrition || {}),
+            };
+          }
+        } catch (dbErr) {
+          console.warn('[api] Local barcode lookup failed:', dbErr);
+        }
+        return null; // Local native mode is strictly local/offline; do not hit the network or query Open Food Facts.
+      }
+
       const res = await _extFetch(`${this.OFF_BASE}/api/v0/product/${barcode}.json`);
       if (!res.ok) return null;
       const data = await res.json();
@@ -71,6 +97,32 @@ const API = {
   async searchByName(query, page) {
     page = page || 1;
     try {
+      const { isNative, getNativeMode } = await import('./platform.js');
+      if (isNative && getNativeMode() === 'local') {
+        try {
+          const { getDb } = await import('./db-native.js');
+          const db = await getDb();
+          const clean = `%${query.trim()}%`;
+          const r = await db.query(
+            `SELECT * FROM foods WHERE (name LIKE ? OR brand LIKE ?) AND deleted_at IS NULL LIMIT 50`,
+            [clean, clean]
+          );
+          const rows = r?.values || [];
+          return rows.map(row => {
+            const categories = row.category ? [row.category] : [];
+            return {
+              ...row,
+              imgUrl: row.img_url || '',
+              categories,
+              nutrition: typeof row.nutrition === 'string' ? JSON.parse(row.nutrition) : (row.nutrition || {}),
+            };
+          });
+        } catch (dbErr) {
+          console.warn('[api] Local search failed:', dbErr);
+        }
+        return []; // Local native mode is strictly local/offline; do not hit the network or query Open Food Facts.
+      }
+
       const offUrl = `https://search.openfoodfacts.org/search?q=${encodeURIComponent(query)}&json=1&page_size=20&page=${page}`;
       const res = await _extFetch(offUrl);
       if (!res.ok) return [];

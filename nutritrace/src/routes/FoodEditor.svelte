@@ -1,3 +1,5 @@
+<svelte:options runes />
+
 <script>
   import { onMount } from 'svelte';
   import { _ } from 'svelte-i18n';
@@ -11,18 +13,17 @@
   import Toggle from '../components/settings/Toggle.svelte';
   import UnitPicker from '../components/ui/UnitPicker.svelte';
   import { takePhoto } from '../lib/camera.js';
-  import { isNative } from '../lib/platform.js';
+  import { isNative, getNativeMode } from '../lib/platform.js';
   import BarcodeScanner from '../components/foods/BarcodeScanner.svelte';
-  import { foodsShowCategories, foodsShowLabels, foodsShowNotes, foodCategories, visibleNutriments, nutrimentsOrder, customNutriments, cropPhotos, offUsername, offPassword, offUploadCountry, aiEffectivelyEnabled, envLocks, aiProvider, aiApiKey, aiModel, aiBaseUrl, energyUnit, catName as _catName, catDisplay as _catDisplay } from '../stores/settings.js';
+  import { foodsShowCategories, foodsShowLabels, foodsShowNotes, foodCategories, visibleNutriments, nutrimentsOrder, customNutriments, cropPhotos, offUsername, offPassword, offUploadCountry, energyUnit, catName as _catName, catDisplay as _catDisplay } from '../stores/settings.js';
   import { DIET_TYPES, DIET_LABELS } from '../lib/dietType.js';
-  import { callAI, callAIProxy } from '../lib/aiChat.js';
   import { fitImageDataUrl } from '../lib/image-fit.js';
 
   // ── Photo capture / upload ─────────────────────────────────
   let fileInput;
-  let showCamera  = false;
-  let showUrlInput = false;
-  let photoUrl = '';
+  let showCamera = $state(false);
+  let showUrlInput = $state(false);
+  let photoUrl = $state('');
   function applyPhotoUrl() {
     const url = photoUrl.trim();
     if (url) { food.imgUrl = url; }
@@ -31,10 +32,10 @@
   }
   let cameraVideo = null;
   let cameraStream = null;
-  let showCrop    = false;
-  let cropSrc     = '';
-  let cropImg     = null;
-  let cropBox     = null;
+  let showCrop = $state(false);
+  let cropSrc = $state('');
+  let cropImg = null;
+  let cropBox = null;
   let cropDragging = false, cropStartX, cropStartY, cropOrigL, cropOrigT;
 
   function openGallery() { fileInput && fileInput.click(); }
@@ -150,9 +151,10 @@
     showCrop = false; cropSrc = '';
   }
 
-  export let params = {};
+  let { params } = $props();
+  if (!params) params = {};
 
-  let food = {
+  let food = $state({
     name:'', brand:'', barcode:'', imgUrl:'',
     portion: 100, unit: 'g', categories: [], notes: '', diet_type: 'vegetarian',
     calories: '', kilojoules: '', fat: '', 'saturated-fat': '', 'trans-fat': '', 'polyunsaturated-fat': '', 'monounsaturated-fat': '', carbohydrates: '',
@@ -167,16 +169,16 @@
     // in nutrition._derived on the saved food so the calculator icon
     // survives reloads.
     _derived: {},
-  };
+  });
   let store = 'foodList';
-  let saving = false;
-  let showAllNutrients = false;
-  let contributing = false;
-  let offSuccess = false;
+  let saving = $state(false);
+  let showAllNutrients = $state(false);
+  let contributing = $state(false);
+  let offSuccess = $state(false);
   // Off by default — proportional scaling can surprise users editing a single
   // value (e.g. correcting a typo'd protein gram). User opts in via the link
   // toggle next to the unit selector.
-  let linked = false;
+  let linked = $state(false);
   // Snapshot of values used as the baseline for proportional scaling.
   // Captured the moment the user flips `linked` on, NOT at mount: at
   // mount the food may be empty (new food), and even for edit-food the
@@ -184,17 +186,20 @@
   // it on toggle means the snapshot reflects the user's "lock these
   // proportions in" intent, not whatever was loaded.
   let _snapshot = null;
-  let downloading = false;
-  let downloadSuccess = false;
-  let editorScannerOpen = false;
+  let downloading = $state(false);
+  let downloadSuccess = $state(false);
+  let editorScannerOpen = $state(false);
   // Cached list of the user's foods, used for client-side duplicate-barcode
   // detection. Populated once on mount; refreshed only when the editor saves
   // (so a save+stay-open flow can re-check). Whitespace + leading-zero
   // normalisation matches the picker-page lookup behaviour.
   let _myFoods = [];
-  let duplicateOf = null;
-  $: isNewFood = !(params && params.id);
-  $: hasBarcode = !!(food.barcode && food.barcode.trim());
+  let duplicateOf = $state(null);
+  let matchedIngredients = $state([]);
+  let ingredientsText = $state('');
+  let isNewFood = $derived(!(params && params.id));
+  let hasBarcode = $derived(!!(food.barcode && food.barcode.trim()));
+  let isNativeLocal = $derived(isNative && getNativeMode() === 'local');
 
   function _normBarcode(b) {
     return String(b || '').trim().replace(/^0+/, '');
@@ -202,16 +207,17 @@
   // Reactively check for a duplicate barcode in the user's library whenever
   // the field changes. Excludes the food currently being edited so editing
   // an existing food doesn't flag itself.
-  $: {
-    if (!food.barcode || !food.barcode.trim()) {
+  $effect(() => {
+    const bc = food.barcode;
+    if (!bc || !bc.trim()) {
       duplicateOf = null;
     } else if (_myFoods && _myFoods.length) {
-      const codeN = _normBarcode(food.barcode);
+      const codeN = _normBarcode(bc);
       duplicateOf = _myFoods.find(f =>
         f.id !== food.id && f.barcode && _normBarcode(f.barcode) === codeN
       ) || null;
     }
-  }
+  });
 
   // Inline scan handler — populate the barcode field, then auto-prefill the
   // form from OFF if the user hasn't typed anything substantive yet. Skips
@@ -221,11 +227,10 @@
     const code = detail?.code;
     if (!code) return;
     food.barcode = code;
-    food = food;
     const looksEmpty = !food.name?.trim() && !food.brand?.trim() &&
       (food.nutrition == null || Object.keys(food.nutrition || {}).length === 0) &&
       !NUTRIMENTS.some(n => food[n.id] != null && food[n.id] !== '');
-    if (looksEmpty) {
+    if (looksEmpty && !isNativeLocal) {
       // Re-use the existing smart-fill that only writes empty fields.
       await downloadFromOFF();
     } else {
@@ -242,6 +247,7 @@
   let _lastCheckedBarcode = null;
 
   async function _refreshOffPresence() {
+    if (isNativeLocal) { offProductExists = null; return; }
     if (!food.barcode) { offProductExists = null; return; }
     if (_lastCheckedBarcode === food.barcode) return; // no-op refresh
     _lastCheckedBarcode = food.barcode;
@@ -255,7 +261,9 @@
       offProductExists = false;
     }
   }
-  $: if (food.barcode && food.barcode !== _lastCheckedBarcode) _refreshOffPresence();
+  $effect(() => {
+    if (food.barcode && food.barcode !== _lastCheckedBarcode) _refreshOffPresence();
+  });
 
   async function _openOffPage() {
     const url = 'https://world.openfoodfacts.org/product/' + encodeURIComponent(food.barcode);
@@ -273,6 +281,7 @@
   }
 
   async function shareOrViewOnOFF() {
+    if (isNativeLocal) return;
     if (offProductExists) {
       await _openOffPage();
       return;
@@ -391,10 +400,10 @@
         food._derived = { ...food._derived, sodium: true };
       }
     }
-    food = food; // trigger Svelte reactivity
   }
 
   async function downloadFromOFF() {
+    if (isNativeLocal) return;
     if (!food.barcode) return;
     downloading = true; downloadSuccess = false;
     try {
@@ -420,139 +429,68 @@
     } finally { downloading = false; }
   }
 
-  // ── Scan Label (AI vision) ──────────────────────────────────────────────────
-  // Camera flow: user taps the icon in the Nutrition card header, takes a photo
-  // of the food's nutrition label, the configured AI provider extracts values,
-  // and OVERWRITES the form's nutrition fields (the label is the source of
-  // truth in this moment, distinct from Refresh from OFF which smart-fills).
-  // Gated on $aiEffectivelyEnabled — button is hidden when AI isn't configured.
-  let scanningLabel = false;
-  let scanLabelFileInput;
+  // Scan Label operations are fully delegated to the shared BarcodeScanner component.
 
-  async function _captureLabelPhoto() {
-    if (isNative) {
-      try {
-        const { Camera, CameraResultType, CameraSource } = await import('@capacitor/camera');
-        const photo = await Camera.getPhoto({
-          quality: 80, resultType: CameraResultType.Base64,
-          source: CameraSource.Camera, width: 1600,
-        });
-        return { base64: photo.base64String, mimeType: `image/${photo.format || 'jpeg'}` };
-      } catch {
-        return null;
-      }
-    }
-    // Web: trigger the hidden file input + camera capture attribute and resolve
-    // on change. The element lives in the template below.
-    return new Promise((resolve) => {
-      const handler = (e) => {
-        scanLabelFileInput.removeEventListener('change', handler);
-        const file = e.target.files?.[0];
-        if (!file) { resolve(null); return; }
-        const reader = new FileReader();
-        reader.onload = () => {
-          const dataUrl = reader.result;
-          // dataUrl: data:image/jpeg;base64,XXXX → split into mime + base64
-          const m = /^data:([^;]+);base64,(.+)$/.exec(dataUrl);
-          if (!m) { resolve(null); return; }
-          resolve({ mimeType: m[1], base64: m[2] });
-        };
-        reader.readAsDataURL(file);
-      };
-      scanLabelFileInput.addEventListener('change', handler);
-      scanLabelFileInput.value = '';
-      scanLabelFileInput.click();
-    });
-  }
-
-  function _buildLabelMessages(provider, image) {
-    // Build the prompt + image payload. Each provider has its own multimodal
-    // format. Same shape pattern used by Trace.svelte#_buildImageMessage.
-    const prompt = [
-      'Extract nutrition facts from this label image.',
-      'Return ONLY a JSON object with these keys (omit keys you cannot read):',
-      '  name (string, product name), brand (string), portion (number), unit (string, one of g/ml/oz/fl oz/cup/tsp/tbsp/lb/kg/l/each),',
-      '  per_serving (boolean, true if the listed values are per serving, false if per 100g),',
-      '  calories (kcal), kilojoules (kJ),',
-      '  fat (g), saturated-fat (g), trans-fat (g), polyunsaturated-fat (g), monounsaturated-fat (g),',
-      '  carbohydrates (g), sugars (g), added-sugars (g), fiber (g),',
-      '  proteins (g),',
-      '  sodium (mg), salt (g), potassium (mg), cholesterol (mg),',
-      '  calcium (mg), iron (mg), magnesium (mg), zinc (mg), phosphorus (mg),',
-      '  vitamin-d (µg), vitamin-a (µg), vitamin-c (mg), vitamin-e (mg), vitamin-k (µg),',
-      '  b1 (mg), b2 (mg), b3 (mg), b6 (mg), b9 (µg), b12 (µg),',
-      '  caffeine (mg), alcohol (g)',
-      'Use numbers, not strings. Use the units specified, not the label\'s.',
-      'No commentary, no markdown — JSON only.',
-    ].join('\n');
-    if (provider === 'claude') {
-      return [{ role: 'user', content: [
-        { type: 'image', source: { type: 'base64', media_type: image.mimeType, data: image.base64 } },
-        { type: 'text', text: prompt },
-      ]}];
-    }
-    if (provider === 'openai' || provider === 'oai-compat') {
-      return [{ role: 'user', content: [
-        { type: 'image_url', image_url: { url: `data:${image.mimeType};base64,${image.base64}` } },
-        { type: 'text', text: prompt },
-      ]}];
-    }
-    if (provider === 'gemini') {
-      return [{ role: 'user', content: prompt, _image: image }];
-    }
-    return [{ role: 'user', content: prompt }];
-  }
-
-  function _parseJsonFromReply(text) {
-    if (!text) return null;
-    // Strip ```json fences if the model added them despite the prompt.
-    const cleaned = text.replace(/^\s*```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim();
-    try { return JSON.parse(cleaned); } catch {}
-    // Fallback: extract the first {...} block.
-    const m = cleaned.match(/\{[\s\S]*\}/);
-    if (m) { try { return JSON.parse(m[0]); } catch {} }
-    return null;
-  }
-
-  async function scanLabel() {
-    if (scanningLabel) return;
-    const image = await _captureLabelPhoto();
-    if (!image || !image.base64) return;
-    scanningLabel = true;
-    try {
-      const provider = $aiProvider || 'claude';
-      const messages = _buildLabelMessages(provider, image);
-      const systemPrompt = 'You are a nutrition label parser. Return JSON only.';
-      const reply = $envLocks.ai
-        ? await callAIProxy({ messages, systemPrompt })
-        : await callAI({
-            provider, apiKey: $aiApiKey, model: $aiModel, baseUrl: $aiBaseUrl,
-            messages, systemPrompt,
-          });
-      const parsed = _parseJsonFromReply(reply);
-      if (!parsed || typeof parsed !== 'object') {
-        showError('Could not read the label. Try a clearer photo.');
-        return;
-      }
-      // Overwrite (NOT smart-fill) — the label is the source of truth this moment.
-      // Mirrors the user's preference: refresh-from-off smart-fills (OFF can be
-      // stale), scan-label overwrites (label is what the user is holding now).
-      if (typeof parsed.name === 'string' && parsed.name.trim()) food.name = parsed.name.trim();
-      if (typeof parsed.brand === 'string' && parsed.brand.trim()) food.brand = parsed.brand.trim();
-      if (parsed.portion != null && !isNaN(parseFloat(parsed.portion))) food.portion = parseFloat(parsed.portion);
-      if (typeof parsed.unit === 'string' && parsed.unit.trim()) food.unit = parsed.unit.trim();
+  function handleOcrSuccess({ detail }) {
+    const parsed = detail.parsed;
+    if (!parsed) return;
+    if (parsed.name) food.name = parsed.name;
+    if (parsed.brand) food.brand = parsed.brand;
+    if (parsed.portion) food.portion = parsed.portion;
+    if (parsed.unit) food.unit = parsed.unit;
+    if (parsed.nutrition) {
       for (const n of NUTRIMENTS) {
-        const v = parsed[n.id];
+        const v = parsed.nutrition[n.id];
         if (v != null && !isNaN(parseFloat(v))) food[n.id] = parseFloat(v);
       }
-      food = { ...food };
-      showSuccess('Nutrition extracted from label');
+    }
+    matchedIngredients = parsed.ingredients || [];
+    ingredientsText = parsed.ingredientsText || '';
+    food = { ...food };
+    showSuccess('Nutrition extracted from label');
+  }
+
+  async function runLocalIngredientMatching() {
+    if (!ingredientsText.trim()) return;
+    try {
+      const { matchAndCalculateRecipeLocally } = await import('../lib/recipeMatcher.js');
+      const res = await matchAndCalculateRecipeLocally(ingredientsText, food.portion || 100);
+      if (res && res.ingredients) {
+        matchedIngredients = res.ingredients;
+        // The $effect above will auto-compute nutrition from the matched estimates
+        const { showSuccess: toastSuccess } = await import('../stores/toast.js');
+        toastSuccess('Ingredients matched and nutrition calculated!');
+      } else {
+        const { showError } = await import('../stores/toast.js');
+        showError('Could not match any ingredients.');
+      }
     } catch (e) {
-      showError('Scan failed: ' + (e?.message || 'unknown error'));
-    } finally {
-      scanningLabel = false;
+      const { showError } = await import('../stores/toast.js');
+      showError('Matching failed: ' + e.message);
     }
   }
+
+  // Auto-recompute nutrition whenever matchedIngredients or their estPortion changes.
+  // Uses $effect so it automatically tracks deep changes in the $state array.
+  $effect(() => {
+    const items = matchedIngredients;
+    if (!items || items.length === 0) return;
+    const computed = {};
+    NUTRIMENTS.forEach(id => { computed[id] = 0; });
+    items.forEach(item => {
+      const portion = parseFloat(item.estPortion) || 0;
+      const portionFactor = portion / (item.portion || 100);
+      for (const n of NUTRIMENTS) {
+        const val = parseFloat(item.nutrition[n.id]);
+        if (!isNaN(val)) {
+          computed[n.id] = (computed[n.id] || 0) + val * portionFactor;
+        }
+      }
+    });
+    for (const n of NUTRIMENTS) {
+      food[n.id] = Math.round((computed[n.id] || 0) * 10) / 10;
+    }
+  });
 
 
   onMount(async () => {
@@ -565,11 +503,15 @@
       // Flatten nested nutrition into top-level fields for editing
       const flatNutrition = (prefill.nutrition && typeof prefill.nutrition === 'object') ? { ...prefill.nutrition } : {};
       food = { ...food, ...prefill, ...flatNutrition };
+      matchedIngredients = prefill.ingredients || [];
+      ingredientsText = prefill.ingredientsText || '';
     } else if (params && params.id) {
       const existing = await NtApi.getFood(params.id).catch(() => null);
       if (existing) {
         const flatNutrition = (existing.nutrition && typeof existing.nutrition === 'object') ? { ...existing.nutrition } : {};
         food = { ...food, ...existing, ...flatNutrition };
+        matchedIngredients = existing.ingredients || [];
+        ingredientsText = existing.ingredientsText || '';
       }
     }
     // Default `linked` to ON when editing an existing food (the user is
@@ -591,7 +533,7 @@
   // Read-only when viewing someone else's shared food. Server returns 403 on
   // PUT regardless, but locking the UI prevents the user from typing into a
   // form that won't save and gives them a single clear action: Save a Copy.
-  $: _readOnly = !!food._shared_by;
+  let _readOnly = $derived(!!food._shared_by);
 
   async function saveAsCopy() {
     saving = true;
@@ -693,14 +635,14 @@
       return ai - bi;
     });
   }
-  $: visibleFields = (() => {
+  let visibleFields = $derived.by(() => {
     const vis = $visibleNutriments;
     const base = vis ? NUTRIMENTS.filter(n => vis.includes(n.id)) : NUTRIMENTS.filter(n => n.default);
     return _applyOrder(base);
-  })();
+  });
 
-  $: allFields = _applyOrder(NUTRIMENTS);
-  $: displayFields = showAllNutrients ? allFields : visibleFields;
+  let allFields = $derived(_applyOrder(NUTRIMENTS));
+  let displayFields = $derived(showAllNutrients ? allFields : visibleFields);
 </script>
 
 <div class="page-shell editor-page">
@@ -880,7 +822,7 @@
             }}>Open existing →</button>
           </div>
         {/if}
-        {#if hasBarcode}
+        {#if hasBarcode && !isNativeLocal}
           <div class="form-row" style="gap:8px;margin-top:8px">
             <button class="btn btn-secondary" style="flex:1"
               on:click={shareOrViewOnOFF} disabled={contributing}>
@@ -958,24 +900,61 @@
       </div>
     {/if}
 
+    <!-- Ingredients & Matching Card -->
+    <div class="card editor-card">
+      <div class="editor-card-title">
+        <span>Ingredients (Local DB Matching)</span>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Raw Ingredients List</label>
+        <textarea class="input textarea" style="min-height: 80px" placeholder="Wheat flour, sugar, palm oil..." bind:value={ingredientsText}></textarea>
+        {#if ingredientsText.trim()}
+          <button type="button" class="btn btn-secondary" style="width: 100%; min-height: 44px; margin-top: 8px; display: flex; align-items: center; justify-content: center; gap: 8px" on:click={runLocalIngredientMatching}>
+            <span class="material-symbols-rounded" style="font-size: 20px">hdr_strong</span>
+            <span>Match & Estimate</span>
+          </button>
+        {/if}
+      </div>
+
+      {#if matchedIngredients.length > 0}
+        <div class="matched-ingredients-list" style="margin-top:12px;border-top:1px solid var(--border);padding-top:12px">
+          <div style="font-weight:600;font-size:13px;margin-bottom:8px;color:var(--text-2)">
+            Matched Foods & Estimated Weight (Portion: {food.portion}{food.unit}):
+          </div>
+          <div style="display:flex;flex-direction:column;gap:8px">
+            {#each matchedIngredients as item}
+              <div style="display:flex;justify-content:space-between;align-items:center;font-size:13px;padding:4px 0">
+                <span style="color:var(--text-1)">
+                  {item.name} 
+                  {#if item.id == null}
+                    <span style="color:var(--warning,#f59e0b);font-size:11px;margin-left:4px">(No direct database match)</span>
+                  {:else}
+                    <span style="color:var(--accent);font-size:11px;margin-left:4px">(IFCT Seeded)</span>
+                  {/if}
+                </span>
+                <div style="display:flex;align-items:center;gap:6px">
+                  <input class="input" type="number" min="0" max="1000" step="1" style="width:75px;padding:6px 8px;text-align:right;height:40px;font-size:13px;border:1px solid var(--border);border-radius:var(--radius-sm,#8px)"
+                    bind:value={item.estPortion} />
+                  <span style="color:var(--text-2);font-weight:500">{item.unit}</span>
+                </div>
+              </div>
+            {/each}
+          </div>
+        </div>
+      {/if}
+    </div>
+
     <!-- Nutrition -->
     <div class="card editor-card">
       <div class="editor-card-title" style="display:flex;align-items:center;justify-content:space-between;gap:8px">
         <span>Nutrition</span>
-        {#if $aiEffectivelyEnabled}
-          <button class="scan-label-btn" on:click={scanLabel} disabled={scanningLabel}
-            title="Take a photo of the nutrition label to fill these fields"
-            aria-label="Scan nutrition label">
-            <span class="material-symbols-rounded scan-icon" class:spin={scanningLabel}>
-              {scanningLabel ? 'progress_activity' : 'photo_camera'}
-            </span>
-            <span>{scanningLabel ? 'Scanning…' : 'Scan Label'}</span>
-          </button>
-        {/if}
+        <button type="button" class="scan-label-btn" on:click={() => { editorScannerOpen = true; }}
+          title="Take a photo of the nutrition label to fill these fields"
+          aria-label="Scan nutrition label">
+          <span class="material-symbols-rounded scan-icon">photo_camera</span>
+          <span>Scan Label</span>
+        </button>
       </div>
-      <!-- Hidden file input for the web Scan Label flow. On native we go
-           through @capacitor/camera directly. -->
-      <input bind:this={scanLabelFileInput} type="file" accept="image/*" capture="environment" style="display:none" />
       {#each displayFields as n}
         {@const _kjMode = n.id === 'calories' && $energyUnit === 'kJ'}
         <div class="form-group" class:nutrient-sub={n.subOf}>
@@ -1008,7 +987,7 @@
 </div>
 
 <!-- Inline barcode scanner — fired by the scan button next to the Barcode field -->
-<BarcodeScanner bind:open={editorScannerOpen} on:scan={onEditorScan} on:close={() => editorScannerOpen = false} />
+<BarcodeScanner bind:open={editorScannerOpen} on:scan={onEditorScan} on:scan-label-success={handleOcrSuccess} on:close={() => editorScannerOpen = false} />
 
 <style>
   /* Indented sub-nutrient rows — Saturated Fat under Total Fat, Sugars
@@ -1212,7 +1191,7 @@
     display: inline-flex;
     align-items: center;
     gap: 6px;
-    height: 32px;
+    min-height: 44px;
     padding: 0 12px;
     border-radius: var(--radius-md);
     background: var(--surface-2);
@@ -1227,13 +1206,6 @@
   .scan-label-btn:disabled { opacity: 0.6; cursor: not-allowed; }
   .scan-label-btn .material-symbols-rounded { font-size: 18px; }
 
-  /* progress_activity glyph rotates while the AI vision call is in flight.
-     Same pattern used elsewhere (ConnectionStatus, Wizard) but kept
-     component-scoped. */
-  .scan-icon.spin {
-    animation: spin 1s linear infinite;
-    display: inline-block;
-  }
   @keyframes spin { to { transform: rotate(360deg); } }
 
 </style>

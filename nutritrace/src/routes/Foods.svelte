@@ -19,7 +19,7 @@
   import { API, USDA, NtApi } from '../lib/api.js';
   import { Nutrition } from '../lib/nutrition.js';
   import { Mealie } from '../lib/mealieApi.js';
-  import { resolveAssetUrl } from '../lib/platform.js';
+  import { resolveAssetUrl, isNative, getNativeMode } from '../lib/platform.js';
   import { foodsShowThumbnails, foodsShowCategories, foodsShowLabels, foodsShowNotes, foodsSort, mealsSort, recipesSort, foodCategories, foodsShowYesterdayMeals, foodsYesterdayCollapsed, foodsSavedCollapsed, mealNames, usdaEnabled, usdaApiKey, offEnabled, catName as _catName, catDisplay as _catDisplay, pageBanners, bannerStyle, energyUnit, vegetarianMode } from '../stores/settings.js';
   import { isAllowedInVegMode, inferDietType } from '../lib/dietType.js';
   import { mealIcon } from '../lib/mealIcon.js';
@@ -88,15 +88,19 @@
   let search = '';
   let searchSource = 'local';
   const _mealieEnabled = DB.getSetting('mealieEnabled',  false);
+  $: _isNativeLocal = isNative && getNativeMode() === 'local';
+  let _localBannerDismissed = false;
+  $: _showLocalBanner = _isNativeLocal && !_localBannerDismissed;
   // OFF / USDA / Mealie are food databases — only meaningful on the Foods tab.
   // Meals + Recipes tabs only get Local + From Others (when shared content exists).
   $: availableSources = [
-    { value: 'local',  label: $_('foods.sources.local')  },
-    ...(activeTab === 0 && $offEnabled    ? [{ value: 'off',    label: 'OFF' }] : []),
-    ...(activeTab === 0 && $usdaEnabled   ? [{ value: 'usda',   label: 'USDA' }] : []),
-    ...(activeTab === 0 && _mealieEnabled ? [{ value: 'mealie', label: 'Mealie' }] : []),
+    { value: 'local',  label: $_('foods.sources.local') + (_isNativeLocal ? ' (Indian foods)' : '') },
+    ...(activeTab === 0 && !_isNativeLocal && $offEnabled    ? [{ value: 'off',    label: 'OFF' }] : []),
+    ...(activeTab === 0 && !_isNativeLocal && $usdaEnabled   ? [{ value: 'usda',   label: 'USDA' }] : []),
+    ...(activeTab === 0 && !_isNativeLocal && _mealieEnabled ? [{ value: 'mealie', label: 'Mealie' }] : []),
     ...(_tabHasShared  ? [{ value: 'shared', label: $_('foods.sources.from_others') }] : []),
   ];
+  $: if (_isNativeLocal && !availableSources.some(s => s.value === searchSource)) searchSource = 'local';
   $: _sourceLabel = availableSources.find(s => s.value === searchSource)?.label || '';
 
   // Sharing — "From Others" source filter (per-category)
@@ -588,6 +592,11 @@
     }
   }
 
+  function dismissLocalBanner() {
+    try { localStorage.setItem('nt:hideLocalBanner', '1'); } catch (e) { /* noop */ }
+    _localBannerDismissed = true;
+  }
+
   // Barcode normalizer — strips whitespace + leading zeros so a UPC-A saved
   // as "0036000291452" matches a scan that returns "36000291452" (and vice
   // versa). Different scanners (ML Kit on Android, Quagga on web) and
@@ -776,6 +785,8 @@
   });
 
   onMount(async () => {
+    // Check if the local-mode banner was previously dismissed
+    try { if (localStorage.getItem('nt:hideLocalBanner') === '1') _localBannerDismissed = true; } catch (e) { /* noop */ }
     // Restore tab before load so the right list is fetched
     if (editorState.foodsActiveTab != null) {
       activeTab = editorState.foodsActiveTab;
@@ -943,6 +954,21 @@
     <div class="server-error-banner">
       <span class="material-symbols-rounded">cloud_off</span>
       <span>Could not reach server — <button class="server-error-retry" on:click={load}>Retry</button></span>
+    </div>
+  {/if}
+
+  {#if _showLocalBanner}
+    <div class="local-banner" role="status">
+      <div class="local-banner-content">
+        <span class="material-symbols-rounded local-banner-icon">info</span>
+        <div class="local-banner-text">
+          <span class="local-banner-heading">External food databases disabled</span>
+          <span class="local-banner-body">You're using NutriTrace in offline mode. Only foods from the local Indian food catalog (IFCT 2017 + INDB 2024) are available. Use the label scanner to add packaged foods.</span>
+        </div>
+      </div>
+      <button class="local-banner-close" on:click={dismissLocalBanner} aria-label="Dismiss">
+        <span class="material-symbols-rounded">close</span>
+      </button>
     </div>
   {/if}
 
@@ -1308,7 +1334,7 @@
   {/if}
 </Sheet>
 
-<BarcodeScanner bind:open={scannerOpen} on:scan={handleScan} on:close={() => scannerOpen = false} />
+<BarcodeScanner bind:open={scannerOpen} on:scan={handleScan} on:scan-label-success={({ detail }) => openEditor(detail.parsed, 'foodList')} on:close={() => scannerOpen = false} />
 
 <!-- Barcode-lookup loading overlay. Deferred reveal (see _armScanIndicator
      above) means fast lookups don't flash this UI; only lookups that run
@@ -1569,6 +1595,61 @@
     background: none; border: none; padding: 0;
     color: var(--accent); font-size: 14px; font-weight: 600;
     cursor: pointer; text-decoration: underline;
+  }
+
+  .local-banner {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 12px 14px;
+    margin: 0 var(--page-px) 8px;
+    background: var(--accent-dim);
+    border: 1px solid var(--accent);
+    border-radius: var(--radius-lg);
+  }
+  .local-banner-content {
+    display: flex;
+    gap: 10px;
+    flex: 1;
+    min-width: 0;
+  }
+  .local-banner-icon {
+    font-size: 20px;
+    color: var(--accent);
+    flex-shrink: 0;
+    margin-top: 1px;
+  }
+  .local-banner-text {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-width: 0;
+  }
+  .local-banner-heading {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-1);
+  }
+  .local-banner-body {
+    font-size: 13px;
+    line-height: 1.45;
+    color: var(--text-2);
+  }
+  .local-banner-close {
+    background: none;
+    border: none;
+    cursor: pointer;
+    padding: 4px;
+    color: var(--text-3);
+    flex-shrink: 0;
+    margin-top: -2px;
+    margin-right: -4px;
+    border-radius: var(--radius-sm);
+    transition: background var(--dur-fast);
+  }
+  .local-banner-close:hover {
+    color: var(--text-1);
+    background: var(--surface-2);
   }
 
   .empty-state {

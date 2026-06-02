@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "test": "node --test src/lib/*.test.js",
+    "test:scan-label": "node --test src/lib/scan-label.test.js",
     "preview": "vite preview",
     "postinstall": "node scripts/postinstall.cjs"
   },
@@ -27,6 +29,7 @@
     "@capacitor/splash-screen": "^8.0.1",
     "@capacitor/status-bar": "^8.0.2",
     "@devmaxime/capacitor-health-connect": "^1.1.0",
+    "@jcesarmobile/capacitor-ocr": "^0.3.0",
     "@zxcvbn-ts/core": "^3.0.4",
     "@zxcvbn-ts/language-common": "^3.0.4",
     "@zxcvbn-ts/language-en": "^3.0.2",
